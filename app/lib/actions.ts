@@ -6,6 +6,7 @@ import postgres from "postgres";
 import { redirect } from "next/navigation";
 import { signIn } from "@/auth";
 import { AuthError } from "next-auth";
+import { logger } from "./logger";
 
 const sql = postgres(process.env.POSTGRES_URL!, { ssl: "require" });
 
@@ -110,20 +111,43 @@ export async function updateInvoice(
 }
 
 export async function deleteInvoice(id: string) {
-  throw new Error("Failed to Delete Invoice");
-
-  await sql`DELETE FROM invoices WHERE id = ${id}`;
-  revalidatePath("/dashboard/invoices");
+  try {
+    await sql`DELETE FROM invoices WHERE id = ${id}`;
+    revalidatePath("/dashboard/invoices");
+    return { message: "Invoice deleted successfully." };
+  } catch (error) {
+    return { message: "Database Error: Failed to Delete Invoice." };
+  }
 }
 
 export async function authenticate(
   prevState: string | undefined,
   formData: FormData,
 ) {
+  // Note: For production, implement IP-based rate limiting via API route
+  // This provides email-based rate limiting as a backup measure
+  const email = formData.get('email') as string;
+
+  if (email) {
+    const { rateLimit } = await import('./rate-limit');
+    const rateLimitResult = await rateLimit(`auth:${email}`, {
+      interval: 15 * 60 * 1000, // 15 minutes
+      maxRequests: 5, // 5 attempts per email per 15 minutes
+    });
+
+    if (!rateLimitResult.success) {
+      const minutesLeft = Math.ceil((rateLimitResult.reset - Date.now()) / 60000);
+      logger.security('Rate limit exceeded', 'medium', { email, remainingTime: minutesLeft });
+      return `Too many login attempts. Please try again in ${minutesLeft} minute${minutesLeft !== 1 ? 's' : ''}.`;
+    }
+  }
+
   try {
     await signIn('credentials', formData);
+    logger.auth('Login successful', email || undefined);
   } catch (error) {
     if (error instanceof AuthError) {
+      logger.auth('Login failed', email || undefined, { error: error.type });
       switch (error.type) {
         case 'CredentialsSignin':
           return 'Invalid credentials.';
@@ -131,6 +155,7 @@ export async function authenticate(
           return 'Something went wrong.';
       }
     }
+    logger.error('Authentication error', { error, email });
     throw error;
   }
 }
